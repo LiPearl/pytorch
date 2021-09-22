@@ -14,7 +14,6 @@
 #include <algorithm>
 #include <c10/macros/Macros.h>
 
-
 // Crude benchmarks suggest 256 is better than 512 and 1024
 // TODO: Autotune/use better heuristics, improve speed more.
 const int MAX_BLOCK_SIZE = 256;
@@ -33,18 +32,18 @@ __global__ void spatialDepthwiseConvolutionUpdateOutput(
     const THCDeviceTensor<T, 1> bias,
     bool biasEnabled,
     IndexType totalElements,
+    const int inputChannels,
     const int outputChannels,
-    const int depthwiseMultiplier,
+    const float depthwiseMultiplier,
     const int inputWidth, const int inputHeight,
     const int outputWidth, const int outputHeight,
     const int kernelWidth, const int kernelHeight,
     const int strideWidth, const int strideHeight,
     const int padWidth, const int padHeight,
-    const int dilationWidth, const int dilationHeight)
+    const int dilationWidth, const int dilationHeight, const int sumChannels)
 {
   const int KW_LIMIT = (kSize !=0) ? kSize : kernelWidth;
   const int KH_LIMIT = (kSize !=0) ? kSize : kernelHeight;
-
 
   for (IndexType linearIndex = blockIdx.x * blockDim.x + threadIdx.x;
        linearIndex < totalElements;
@@ -66,36 +65,41 @@ __global__ void spatialDepthwiseConvolutionUpdateOutput(
     const int n = indtmp2;
 
     int inputChannel = c;
-    int inputChannels = outputChannels;
-    if (depthwiseMultiplier !=1) {
-      inputChannel /= depthwiseMultiplier;
-      inputChannels /= depthwiseMultiplier;
-    }
-
-    int weightOffset = c * kernelHeight * kernelWidth;
+    inputChannel = c / depthwiseMultiplier;
+    
+    int weightOffset = c * sumChannels * kernelHeight * kernelWidth;
 
     AccT value = biasEnabled ? ScalarConvert<T, AccT>::to(bias.data()[c]) : ScalarConvert<int, AccT>::to(0);
-    const IndexType offset0 = (n * inputChannels + inputChannel) * inputHeight * inputWidth;
-#ifndef __HIP_PLATFORM_HCC__
-#pragma unroll
-#endif
-    for (int kH = 0; kH < KH_LIMIT; ++kH) {
-#ifndef __HIP_PLATFORM_HCC__
-#pragma unroll
-#endif
-      for (int kW = 0; kW < KW_LIMIT; ++kW) {
-        const int h_in = -padHeight + h * strideHeight + kH * dilationHeight;
-        const int w_in = -padWidth + w * strideWidth + kW * dilationWidth;
 
-        if ((h_in >= 0) && (h_in < inputHeight) && (w_in >= 0) && (w_in < inputWidth)) {
-          const IndexType offset = offset0 + h_in * inputWidth + w_in;
-          value = THCNumerics<AccT>::add(
-            value,
-            THCNumerics<AccT>::mul(
-              ScalarConvert<T, AccT>::to(weight.data()[weightOffset]),
-              ScalarConvert<T, AccT>::to(input.data()[offset])));
+    const int batchOffset = n * inputChannels;
+
+    //*********sum channels in each group************
+    for (int shiftChannel = 0; shiftChannel < sumChannels; ++shiftChannel){
+      int channelOffset = (inputChannel + shiftChannel) % inputChannels;
+      channelOffset = batchOffset + channelOffset;
+      const IndexType offset0 = channelOffset * inputHeight * inputWidth;
+
+#ifndef __HIP_PLATFORM_HCC__
+#pragma unroll
+#endif
+      for (int kH = 0; kH < KH_LIMIT; ++kH) {
+#ifndef __HIP_PLATFORM_HCC__
+#pragma unroll
+#endif
+        for (int kW = 0; kW < KW_LIMIT; ++kW) {
+          const int h_in = -padHeight + h * strideHeight + kH * dilationHeight;
+          const int w_in = -padWidth + w * strideWidth + kW * dilationWidth;
+
+          if ((h_in >= 0) && (h_in < inputHeight) && (w_in >= 0) && (w_in < inputWidth)) {
+            const IndexType offset = offset0 + h_in * inputWidth + w_in;
+            value = THCNumerics<AccT>::add(
+              value,
+              THCNumerics<AccT>::mul(
+                ScalarConvert<T, AccT>::to(weight.data()[weightOffset]),
+                ScalarConvert<T, AccT>::to(input.data()[offset])));
+          }
+          ++weightOffset;
         }
-        ++weightOffset;
       }
     }
     output.data()[linearIndex] = ScalarConvert<AccT, T>::to(value);
@@ -109,14 +113,14 @@ __global__ void spatialDepthwiseConvolutionUpdateGradInput(
     const THCDeviceTensor<T, 4> weight,
     IndexType totalElements,
     const int inputChannels,
-    const int depthwiseMultiplier,
     const int outputChannels,
+    const float depthwiseMultiplier,
     const int inputWidth, const int inputHeight,
     const int outputWidth, const int outputHeight,
     const int kernelWidth, const int kernelHeight,
     const int strideWidth, const int strideHeight,
     const int padWidth, const int padHeight,
-    const int dilationWidth, const int dilationHeight)
+    const int dilationWidth, const int dilationHeight, const int sumChannels)
 {
   const int KW_LIMIT = (kSize !=0) ? kSize : kernelWidth;
   const int KH_LIMIT = (kSize !=0) ? kSize : kernelHeight;
@@ -141,9 +145,37 @@ __global__ void spatialDepthwiseConvolutionUpdateGradInput(
 #ifndef __HIP_PLATFORM_HCC__
 #pragma unroll
 #endif
-    for (int multiplier = 0; multiplier < depthwiseMultiplier; ++multiplier) {
-      int och = (c * depthwiseMultiplier) + multiplier;
-      int weightOffset = och * kernelHeight * kernelWidth;
+
+    int inputChannel = c;
+    int ceil = inputChannel;
+    if (depthwiseMultiplier <= 1)//division using round down
+      ceil = ceil * depthwiseMultiplier;
+    else//mul using round up
+      ceil = (ceil + 1) * depthwiseMultiplier - 1;
+    int floor = ceil - (sumChannels * depthwiseMultiplier - 1);
+    floor = (floor + outputChannels) % outputChannels;//Cycle
+
+    for (int outputChannel = 0; outputChannel < outputChannels; ++outputChannel) {
+      if (floor < ceil) {//[floor, ceil]
+        if (outputChannel < floor || outputChannel > ceil)
+          continue;
+      }
+      else if (floor > ceil) {//[0, ceil] U [floor, outputChannels)
+        if (outputChannel > ceil && outputChannel < floor)
+          continue;
+      }
+      else {//ceil = floor = outputChannel
+        if (outputChannel != ceil)
+          continue;
+      }
+
+      int weigColIndex = inputChannel - (int)(outputChannel / depthwiseMultiplier);
+      if (weigColIndex < 0)
+        weigColIndex += inputChannels;
+      int weigIndex = outputChannel * sumChannels + weigColIndex;
+
+      int och = outputChannel;
+      int weightOffset = weigIndex * kernelHeight * kernelWidth;
 #ifndef __HIP_PLATFORM_HCC__
 #pragma unroll
 #endif
@@ -186,14 +218,15 @@ __global__ void spatialDepthwiseConvolutionAccGradParameters(
     THCDeviceTensor<T, 4> gradWeight,
     const int batchSize,
     const int inputChannels,
-    const int kernelChannels,
-    const int depthwiseMultiplier,
+    const int outputChannels,
+    const float depthwiseMultiplier,
     const int inputWidth, const int inputHeight,
     const int outputWidth, const int outputHeight,
     const int kernelWidth, const int kernelHeight,
     const int strideWidth, const int strideHeight,
     const int padWidth, const int padHeight,
-    const int dilationWidth, const int dilationHeight)
+    const int dilationWidth, const int dilationHeight, 
+    const int sumChannels)
 {
   const int channelStride = kernelWidth * kernelHeight;
 
@@ -209,7 +242,10 @@ __global__ void spatialDepthwiseConvolutionAccGradParameters(
 
   // Need to calculate which input channel is associated with this filter
   // channel
-  int inputCh = ch / depthwiseMultiplier;
+  int weigIndex = ch;
+  int outputCh = weigIndex / sumChannels;
+	int weigColIndex = (weigIndex - outputCh * sumChannels);
+	int inputCh = ((int)(outputCh / depthwiseMultiplier) + weigColIndex) % inputChannels;
 
   AccT grad = ScalarConvert<float, AccT>::to(0.0);
 
@@ -238,8 +274,8 @@ __global__ void spatialDepthwiseConvolutionAccGradParameters(
       int i_h_offset = (go_h_offset * strideHeight) + (kH * dilationHeight) - padHeight;
 
       if (i_w_offset >= 0 && i_h_offset >= 0 && i_w_offset < inputWidth && i_h_offset < inputHeight) {
-        int inputOffset = ((batchIdx * inputChannels + inputCh) * inputHeight + i_h_offset) * inputWidth + i_w_offset;
-        int outputOffset = ((batchIdx * kernelChannels + ch) * outputHeight ) * outputWidth + idx;
+        int inputOffset = ((batchIdx * inputChannels + inputCh) * inputHeight + i_h_offset) * inputWidth + i_w_offset;     
+        int outputOffset = ((batchIdx * outputChannels + outputCh) * outputHeight ) * outputWidth + idx;
         grad = THCNumerics<AccT>::add(
             grad,
             THCNumerics<AccT>::mul(
